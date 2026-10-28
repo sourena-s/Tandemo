@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tandemo"
+version = "0.1.0"
+description = "Distributions of true tandem-repeat lengths per locus and haplotype from PacBio HiFi reads: a learned read likelihood (network 1) and a soft-phased mixture fit (Stage 2)"
+requires-python = ">=3.10"
+dependencies = ["numpy", "scipy", "pandas", "pysam>=0.22", "pyarrow"]
+
+[project.optional-dependencies]
+torch = ["torch>=2.1"]
+test = ["pytest"]
+
+[project.scripts]
+tandemo = "tandemo.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["tandemo*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,25 @@
+\begin{tabularx}{\textwidth}{@{}l l l l L@{}}
+\toprule
+group & feature & source column & transform & meaning \\
+\midrule
+read & \texttt{rq\_phred} & \texttt{rq} & Phred & HiFi read quality as Phred, -10 log10(1 - rq), capped at 60 \\
+read & \texttt{np\_log} & \texttt{np} & log(1+x) & CCS passes, log(1 + np) \\
+read & \texttt{read\_len\_log} & \texttt{read\_len} & log10 & read length, log10 bp \\
+read & \texttt{mapq} & \texttt{mapq} & x/60 & mapping quality / 60 \\
+read & \texttt{has\_sa} & \texttt{n\_sa} & $x>0$ & read has supplementary alignments \\
+read & \texttt{bq\_rep} & \texttt{bq\_rep} & x/40 & mean base quality over the read's repeat bases / 40 \\
+read & \texttt{bq\_flank} & \texttt{bq\_flank} & x/40 & mean base quality over the two 128 bp flanks / 40 \\
+read & \texttt{dist\_end\_log} & \texttt{dist\_end} & log(1+x) & bases from the repeat to the nearer read end, log \\
+read & \texttt{flank\_err} & \texttt{flank\_id\_min} & 100(1-x) & error rate of the worse flank, 1 - identity, x100 \\
+locus & \texttt{period\_log} & \texttt{period} & log2 & motif period, log2 bp \\
+locus & \texttt{ref\_len\_log} & \texttt{ref\_len} & log(1+x) & reference repeat length, log bp \\
+locus & \texttt{gc} & \texttt{gc} & x & GC fraction of the reference repeat \\
+locus & \texttt{hp\_frac} & \texttt{hp\_frac} & x & fraction of repeat bases in homopolymer runs $\geq$ 4 \\
+locus & \texttt{max\_hp\_log} & \texttt{max\_hp} & log(1+x) & longest homopolymer in the repeat, log \\
+locus & \texttt{cx3} & \texttt{cx3} & x & 3-mer complexity of the repeat (distinct / possible) \\
+locus & \texttt{flank\_cx} & \texttt{flank\_cx} & x & 3-mer complexity of the lower-complexity flank \\
+candidate $L$ & \texttt{L\_log} & -- & -- & candidate true length, log(1 + L), standardised \\
+candidate $L$ & \texttt{L\_vs\_ref} & -- & -- & log(1 + L) - log(1 + reference length): distance of the allele from the reference \\
+candidate $L$ & \texttt{L\_units\_log} & -- & -- & log(1 + L / period): candidate length in motif units \\
+\bottomrule
+\end{tabularx}
