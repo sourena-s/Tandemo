@@ -36,6 +36,9 @@ tandemo train --input ex/stable1 --out noise.npz --empirical     # numpy baselin
 
 # per subject
 tandemo fit --input ex/s --model net1.pt --out fit/s --threads 32 [--shape nonparametric] [--write-curves]
+
+# merge per-chromosome results
+tandemo combine --inputs fit/chr*.lengths.parquet --out fit/s.lengths.parquet
 ```
 
 ## What each step does

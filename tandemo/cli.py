@@ -67,6 +67,10 @@ def main(argv=None):
     f.add_argument("--write-curves", action="store_true")
     _phase_args(f)
 
+    c = sub.add_parser("combine", help="merge per-chromosome lengths tables into one")
+    c.add_argument("--inputs", nargs="+", required=True, help="<out>.lengths.parquet or .tsv.gz files")
+    c.add_argument("--out", required=True, help="output .parquet (gzip TSV without pyarrow)")
+
     a = ap.parse_args(argv)
     if a.cmd == "extract":
         from .extract import Params, extract
@@ -97,6 +101,11 @@ def main(argv=None):
         _, paths = run(a.input, load_model(a.model), a.out, a.subject, p, _phase(a), a.threads,
                        write_curves=a.write_curves, log=lambda m: print(m, file=sys.stderr))
         print("wrote " + ", ".join(paths), file=sys.stderr)
+    elif a.cmd == "combine":
+        import pandas as pd
+        from .fit import write_table
+        parts = [pd.read_parquet(f) if f.endswith(".parquet") else pd.read_csv(f, sep="\t") for f in a.inputs]
+        print("wrote " + write_table(pd.concat(parts, ignore_index=True), a.out), file=sys.stderr)
 
 
 if __name__ == "__main__":
