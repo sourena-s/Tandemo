@@ -6,6 +6,7 @@ motif(s) in column 4 (comma-separated) and an optional ID in column 5.
 
 from __future__ import annotations
 
+import bisect
 import gzip
 from dataclasses import dataclass
 
@@ -58,6 +59,58 @@ def read_catalog(path, regions=None, max_len: int = 20_000) -> list[Locus]:
                 lid = f[4] if len(f) > 4 else f"{chrom}_{s}_{e}"
             out.append(Locus(lid, chrom, s, e, motifs))
     out.sort(key=lambda x: (x.chrom, x.start))
+    return out
+
+
+def read_intervals(path, chroms=None) -> dict:
+    """{chrom: sorted, merged [(start, end)]} from the first three columns of a BED (gzip or not)."""
+    raw: dict = {}
+    with _open(path) as fh:
+        for line in fh:
+            if not line.strip() or line.startswith(("#", "track", "browser")):
+                continue
+            f = line.split("\t", 3)
+            if chroms is not None and f[0] not in chroms:
+                continue
+            raw.setdefault(f[0], []).append((int(f[1]), int(f[2])))
+    out = {}
+    for c, iv in raw.items():
+        iv.sort()
+        m = [iv[0]]
+        for s, e in iv[1:]:
+            if s <= m[-1][1]:
+                m[-1] = (m[-1][0], max(m[-1][1], e))
+            else:
+                m.append((s, e))
+        out[c] = m
+    return out
+
+
+def overlaps(intervals: dict, chrom: str, s: int, e: int) -> bool:
+    iv = intervals.get(chrom)
+    if not iv:
+        return False
+    i = bisect.bisect_left(iv, (e,))
+    return i > 0 and iv[i - 1][1] > s
+
+
+def filter_loci(loci: list[Locus], min_len: int = 0, no_homopolymer: bool = False, exclude: dict | None = None,
+                keep: dict | None = None) -> list[Locus]:
+    """Drop loci shorter than min_len, homopolymer-only loci (every motif 1 bp) and loci overlapping
+    `exclude` (e.g. segmental duplications). Loci overlapping `keep` (the disease loci) or with an ID
+    ending in `_pathogenic` always stay."""
+    out = []
+    for L in loci:
+        if (keep and overlaps(keep, L.chrom, L.start, L.end)) or L.id.endswith("_pathogenic"):
+            out.append(L)
+            continue
+        if L.ref_len < min_len:
+            continue
+        if no_homopolymer and L.motifs and all(len(m) == 1 for m in L.motifs):
+            continue
+        if exclude and overlaps(exclude, L.chrom, L.start, L.end):
+            continue
+        out.append(L)
     return out
 
 

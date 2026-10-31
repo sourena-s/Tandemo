@@ -7,7 +7,6 @@ Outputs
   <out>.curves.parquet    optional (--write-curves): each read's Stage 1 log-likelihood curve,
                           kept where it is within 20 log units of its maximum, with the read's phase
                           weight. Enough to refit Stage 2, or a group-level model, without network 1.
-Parquet needs pyarrow; without it the tables are written as gzip TSV.
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 import pandas as pd
 
-from .data import load, locus_grid
+from .data import TRGT_READ_TOLERANCE, UNTRUSTED_TRGT, assign_alleles, load, locus_grid
 from .noise import NoiseModel
 from .phasing import PhaseParams
 from .stage2 import FitParams, fit_locus
@@ -27,22 +26,20 @@ LEAD = ["subject", "locus", "chrom", "start", "end", "motif", "period", "hap", "
 
 
 def write_table(df: pd.DataFrame, path: str) -> str:
-    try:
-        import pyarrow  # noqa: F401
-        df.to_parquet(path, index=False)
-        return path
-    except ImportError:
-        alt = path.replace(".parquet", ".tsv.gz")
-        df.to_csv(alt, sep="\t", index=False)
-        return alt
+    df.to_parquet(path, index=False)
+    return path
 
 
 def run(prefix: str, model: NoiseModel, out: str, subject: str | None = None, p: FitParams | None = None,
         phase: PhaseParams | None = None, threads: int = 1, chunk: int = 500, write_curves: bool = False,
-        log=print):
+        loci_keep=None, tolerance: float = TRGT_READ_TOLERANCE, untrusted: str = UNTRUSTED_TRGT, log=print):
+    """loci_keep: only these locus ids (default all). Each haplotype's germline reference (the anchor its deviations
+    are measured from) is the checked label: the TRGT allele when the reads support it within `tolerance`, else
+    the reads' local consensus (untrusted "local"), or none, the mode of f (untrusted "drop")."""
     p = p or FitParams()
     subject = subject or os.path.basename(prefix)
-    reads, loci = load(prefix, phase, subject)
+    reads, loci = load(prefix, phase, subject, loci_keep=loci_keep)
+    reads = assign_alleles(reads, tolerance=tolerance, untrusted=untrusted)
     loci = loci.set_index("locus", drop=False)
     groups = [(lid, g) for lid, g in reads.groupby("locus", sort=False) if len(g) >= p.min_reads]
     rows, curves = [], []
@@ -52,11 +49,13 @@ def run(prefix: str, model: NoiseModel, out: str, subject: str | None = None, p:
             jobs = []
             for lid, g in groups[c0:c0 + chunk]:
                 L = loci.loc[lid]
-                grid = locus_grid(g["Y"].to_numpy(), [L["al1"], L["al2"]], model.bins.D)
+                anchors = (int(g["L1"].iloc[0]), int(g["L2"].iloc[0])) if bool(g["label_ok"].iloc[0]) else ()
+                anchors = tuple(a for a in anchors if a >= 0)
+                grid = locus_grid(g["Y"].to_numpy(), list(anchors), model.bins.D)
                 logl = model.log_curves(g, grid).astype(np.float64)
                 H = 1 if int(L.get("ploidy", 2)) == 1 else 2
                 jobs.append((lid, logl, grid, g["w1"].to_numpy(), H, int(L["period"]), L["read_lens"],
-                             (L["al1"], L["al2"]), p))
+                             anchors, p))
                 if write_curves:
                     keep = logl >= logl.max(1, keepdims=True) - 20
                     ii, kk = np.nonzero(keep)

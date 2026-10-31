@@ -3,38 +3,32 @@
 Inputs per locus: each read's Stage 1 curve log l_i(L) on an integer grid, its phase weight w1_i
 (NaN without het evidence), and the selection curve s(L).
 
-Per haplotype h the true-length distribution is
-
-    parametric (default)   f_h(L) = pi_h delta(L - L0_h) + (1 - pi_h) g_h(L),
-                           g_h = skew-normal(xi_h, omega_h, alpha_h) discretised on the grid
-    nonparametric          the same point mass, g_h a free distribution on the grid fitted by EM with
-                           smoothing (EMS)
-
-In both, g_h has no mass within g_min_shift (default max(2, period) bp) of L0. Otherwise a narrow g
-can sit on L0 and absorb ordinary +-1 bp sequencing noise, which makes pi unidentifiable.
-
-Reads keep their haplotype by phase evidence, not by length:
+Per haplotype h, f_h(L) is a free distribution on the grid: the nonparametric maximum-likelihood estimate
+(NPMLE, Kiefer-Wolfowitz) of the mixing distribution. Reads keep their haplotype by phase evidence, not length:
 
     a_ih = (w1_i, 1 - w1_i)    when the read has het evidence
          = (rho, 1 - rho)       when it has none; rho is fitted
 
     p_i  = sum_h a_ih  sum_L l_i(L) f_h(L) s(L) / Z_h,        Z_h = sum_L f_h(L) s(L)
 
-The log-likelihood sum_i log p_i is maximised over L0, pi, the shape of g and rho. s(L) corrects
-for spanning selection: a molecule of length L is only seen when a read is long enough to cover it
-plus both flanks (s(L) proportional to the sum over reads overlapping the locus of
-max(0, R - L - 2 * flank)). f_h is therefore the distribution of molecules, not of kept reads.
+sum_i log p_i is concave in f, so EM reaches the global maximum. The NPMLE is discrete (a few atoms). It is not
+smoothed: smoothing blurs the germline atom into |d| >= Delta and inflates the spread. s(L) corrects for spanning
+selection: a molecule of length L is only seen when a read covers it plus both flanks (s(L) proportional to
+the sum over reads overlapping the locus of max(0, R - L - 2 * flank)), so f_h is the distribution of
+molecules, not of kept reads. M0 (one length per haplotype) is fitted first: it starts EM and gives the
+reference log-likelihood.
 
-M0 (pi = 1 for every haplotype) is fitted first; it gives L0 and the reference log-likelihood.
-M1 starts from it. No p-values: the output reports the fitted distributions, the log-likelihood
-gain, and the quantities below.
-
-Per haplotype: L0, pi, var_weight = 1 - pi, g parameters and moments, p_exp = P(L >= L0 + Delta),
-p_con = P(L <= L0 - Delta) with Delta = max(3, period), mean_abs_dev = E|L - L0|, the reads it
-received (sum of posteriors), and unphased_var_frac: the share of its variable component carried
-by reads without het evidence (their haplotype is decided by length; when this is high, trust the
-locus-level pooled numbers over the per-haplotype split).
-Per locus (repeated on both rows): the pooled numbers, weighted by the haplotype shares.
+Per haplotype, on the deviation scale d = L - L0 and Delta = max(3, period). L0 is the germline allele (the anchor
+nearest the mode of f_h; the mode itself without anchors), so a spread f whose mode wanders off the germline is
+still measured from it:
+U = P(|d| >= Delta) (the unstable fraction), p_exp = P(d >= Delta), p_con = P(d <= -Delta),
+mad = E|d| (bp; the Wasserstein-1 distance from a stable allele: the spread), mean_shift = E[d] (bp: the direction),
+n_atoms (grid points with mass >= 1%), the reads it received (sum of posteriors) and unphased_var_frac (the
+share of its unstable part carried by reads without het evidence; when high, trust the pooled numbers).
+--bootstrap B adds 95% intervals (U_lo/U_hi, mad_lo/mad_hi) from B read resamples. f_h itself is kept (f_L,
+f_p: grid points with mass >= 1e-4) so samples can be compared later without refitting.
+Locus level (pooled_*): the haplotypes' deviation distributions, each on its own d scale, mixed by their read
+shares; the germline lengths drop out, so the same locus compares across samples whatever its alleles.
 """
 
 from __future__ import annotations
@@ -42,22 +36,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.optimize import minimize
-from scipy.special import expit, logsumexp
-from scipy.stats import norm
 
 
 @dataclass
 class FitParams:
-    shape: str = "parametric"         # or "nonparametric"
     min_reads: int = 3
-    omega_min: float | None = None     # g width floor (bp); default max(1, period / 2)
-    np_smooth: float | None = None     # nonparametric smoothing kernel sd (bp); default max(1, period / 2)
-    np_iters: int = 500
+    iters: int = 5000
+    tol: float = 1e-9                  # EM stops when the log-likelihood gains less than tol * |ll|
+    bootstrap: int = 0                 # read resamples for 95% intervals (0: none)
+    seed: int = 0
     selection: bool = True
     flank: int = 128
-    l0_refine: int = 2                 # refine L0 within +- this many periods after M1
-    g_min_shift: int | None = None     # g has no mass within this many bp of L0; default max(2, period)
 
 
 def selection_curve(grid: np.ndarray, read_lens: str | None, flank: int) -> np.ndarray:
@@ -68,24 +57,6 @@ def selection_curve(grid: np.ndarray, read_lens: str | None, flank: int) -> np.n
     if s.max() <= 0:
         return np.ones(len(grid))
     return np.clip(s / s.max(), 1e-3, 1.0)
-
-
-def sn_pmf(grid: np.ndarray, xi: float, omega: float, alpha: float, support=None) -> np.ndarray:
-    """Skew-normal density at the grid points, restricted to `support`, normalised to sum 1."""
-    z = (grid - xi) / omega
-    lp = norm.logpdf(z) + norm.logcdf(alpha * z)
-    if support is not None:
-        lp = np.where(support, lp, -np.inf)
-    lp -= lp.max()
-    p = np.exp(lp)
-    return p / p.sum()
-
-
-def _gauss_smooth(v: np.ndarray, sd: float) -> np.ndarray:
-    r = int(np.ceil(4 * sd))
-    k = np.exp(-0.5 * (np.arange(-r, r + 1) / sd) ** 2)
-    k /= k.sum()
-    return np.convolve(v, k, mode="same")
 
 
 class LocusFit:
@@ -105,14 +76,7 @@ class LocusFit:
         self.period = max(int(period), 1)
         self.s = np.ones(self.G) if s is None else np.asarray(s, dtype=float)
         self.anchors = [a for a in anchors if a is not None and a >= 0]
-        self.omega_min = self.p.omega_min or max(1.0, self.period / 2)
-        self.smooth = self.p.np_smooth or max(1.0, self.period / 2)
-        self.min_shift = self.p.g_min_shift if self.p.g_min_shift is not None else max(2, self.period)
-
-    def g_support(self, k: int) -> np.ndarray:
-        """Grid points g may use: |L - L0| >= min_shift (0 = everywhere except L0's own point mass)."""
-        sup = np.abs(self.grid - self.grid[k]) >= max(self.min_shift, 1)
-        return sup if sup.any() else np.ones(self.G, bool)
+        self.delta = max(3, self.period)
 
     # -------------------------------------------------- shared pieces
     def prior(self, rho: float) -> np.ndarray:
@@ -186,184 +150,108 @@ class LocusFit:
                     best = r
         return best
 
-    def outlier_lengths(self, k, rho, max_n: int = 4):
-        """Most likely true lengths of the reads M0 explains worst (their curve peaks away from both
-        L0s by at least the g exclusion), at most max_n distinct values."""
+    # -------------------------------------------------- free f (NPMLE by EM)
+    def fit_free(self, k, rho0, f0=None):
+        """EM from f0, or from the M0 lengths (half a local bump at each, half uniform: EM cannot grow mass where
+        it starts at zero)."""
+        H = self.H
+        if f0 is None:
+            f = np.zeros((H, self.G))
+            for h in range(H):
+                bump = np.exp(-0.5 * ((self.grid - self.grid[k[h]]) / max(2.0 * self.period, 2.0)) ** 2)
+                f[h] = 0.5 * bump / bump.sum() + 0.5 / self.G
+        else:
+            f = 0.98 * f0 + 0.02 / self.G
+        rho, prev, conv, it = rho0, -np.inf, False, 0
         a = self.prior(rho)
-        pk = np.array([self.E[:, kk] for kk in k]).T          # [n, H] under the point masses
-        fit0 = (a * pk).sum(1)
-        peak = self.grid[np.argmax(self.E, 1)]
-        far = np.all(np.abs(peak[:, None] - self.grid[k][None, :]) >= max(self.min_shift, 1), 1)
-        order = np.argsort(fit0)
-        out = []
-        for i in order:
-            if far[i] and fit0[i] < 0.01 and peak[i] not in out:
-                out.append(int(peak[i]))
-            if len(out) >= max_n:
-                break
-        return out
-
-    # -------------------------------------------------- parametric M1
-    def _unpack(self, th, k):
-        H = self.H
-        f = np.zeros((H, self.G))
-        pis, shapes = [], []
-        for h in range(H):
-            lp, d, lw, al = th[4 * h:4 * h + 4]
-            pi = expit(lp)
-            xi, om = self.grid[k[h]] + d, self.omega_min + np.exp(lw)
-            g = sn_pmf(self.grid, xi, om, al, self.g_support(k[h]))
-            f[h] = (1 - pi) * g
-            f[h, k[h]] += pi
-            pis.append(pi); shapes.append((xi, om, al, g))
-        rho = expit(th[4 * H]) if (H == 2 and self.unph.any()) else 0.5
-        return f, pis, shapes, rho
-
-    def fit_parametric(self, k, rho0):
-        H, p = self.H, self.period
-        span = float(self.grid[-1] - self.grid[0])
-        # (location, width, skew, location is absolute?)
-        inits = [(+2 * p, max(2.0 * p, 3.0), 3.0, False), (-2 * p, max(2.0 * p, 3.0), -3.0, False),
-                 (0.0, max(4.0 * p, 6.0), 0.0, False), (0.0, max(span / 2, 6.0), 0.0, False)]
-        # starts at the reads M0 explains worst: one isolated expanded read is otherwise out of reach
-        for L in self.outlier_lengths(k, rho0):
-            inits.append((float(L), max(1.0 * p, 2.0), 0.0, True))
-        bounds = []
-        for _ in range(H):
-            bounds += [(-9, 9), (-span, span), (-6, np.log(max(span, 2.0))), (-10, 10)]
-        has_rho = H == 2 and self.unph.any()
-        if has_rho:
-            bounds.append((-7, 7))
-        best = None
-        for d, om, al, absolute in inits:
-            th = []
-            for h in range(H):
-                off = d - self.grid[k[h]] if absolute else d
-                th += [np.log(0.95 / 0.05), off, np.log(max(om - self.omega_min, 0.05)), al]
-            if has_rho:
-                th.append(np.log(rho0 / (1 - rho0)))
-            obj = lambda t, k=k: -self.loglik(self._unpack(t, k)[0], self._unpack(t, k)[3])
-            r = minimize(obj, np.array(th, float), method="L-BFGS-B", bounds=bounds)
-            if best is None or r.fun < best[0].fun:
-                best = (r, list(k))
-        r, k = best
-        th = r.x
-        # refine L0 by a local scan, holding the shape fixed, then polish
-        for _ in range(1):
-            for h in range(H):
-                lo = max(0, k[h] - self.p.l0_refine * p); hi = min(self.G - 1, k[h] + self.p.l0_refine * p)
-                cands = range(lo, hi + 1)
-                vals = []
-                for c in cands:
-                    kk = list(k); kk[h] = c
-                    f, _, _, rho = self._unpack(th, kk)
-                    vals.append(self.loglik(f, rho))
-                k[h] = list(cands)[int(np.argmax(vals))]
-            obj = lambda t: -self.loglik(self._unpack(t, k)[0], self._unpack(t, k)[3])
-            r2 = minimize(obj, th, method="L-BFGS-B", bounds=bounds)
-            if r2.fun <= r.fun:
-                r, th = r2, r2.x
-        f, pis, shapes, rho = self._unpack(th, k)
-        at_bound = any(abs(th[4 * h]) >= 8.99 or abs(th[4 * h + 3]) >= 9.99 for h in range(H))
-        return dict(k=k, f=f, pis=pis, shapes=shapes, rho=rho, ll=-float(r.fun), converged=bool(r.success),
-                    at_boundary=at_bound)
-
-    # -------------------------------------------------- nonparametric M1 (EM with smoothing)
-    def fit_nonparametric(self, k, rho0):
-        H = self.H
-        f = np.zeros((H, self.G))
-        g = np.zeros((H, self.G))
-        for h in range(H):
-            sup = self.g_support(k[h])
-            local = _gauss_smooth(np.eye(1, self.G, k[h]).ravel(), max(3.0 * self.period, 3.0)) * sup
-            # half local, half uniform over the support: EM cannot grow mass where it starts at zero
-            g[h] = 0.5 * local / max(local.sum(), 1e-300) + 0.5 * sup / sup.sum()
-            g[h] = g[h] / g[h].sum() if g[h].sum() > 0 else self.g_support(k[h]) / self.g_support(k[h]).sum()
-        pis = np.full(H, 0.9)
-        rho = rho0
-        prev = -np.inf
-        conv = False
-        for it in range(self.p.np_iters):
-            for h in range(H):
-                f[h] = (1 - pis[h]) * g[h]; f[h, k[h]] += pis[h]
-            a = self.prior(rho)
+        for it in range(1, self.p.iters + 1):
             q = f * self.s[None, :]
             q /= q.sum(1, keepdims=True)
             P = self.E @ q.T                                     # [n, H]
             tot = (a * P).sum(1)
             ll = float(np.sum(np.log(np.maximum(tot, 1e-300)) + self.m))
-            if ll - prev < 1e-7 * max(1.0, abs(ll)):
+            if ll - prev < self.p.tol * max(1.0, abs(ll)):
                 conv = True
                 break
             prev = ll
-            post_h = a * P / np.maximum(tot, 1e-300)[:, None]  # [n, H]
+            post = a * P / np.maximum(tot, 1e-300)[:, None]     # [n, H]
             if H == 2 and self.unph.any():
-                rho = float(np.clip(post_h[self.unph, 0].mean(), 1e-3, 1 - 1e-3))
-            for h in range(H):
-                # expected counts over L for haplotype h, then undo selection
-                R = self.E * q[h][None, :] / np.maximum(P[:, h:h + 1], 1e-300) * post_h[:, h:h + 1]
-                c = R.sum(0) / self.s
-                c /= c.sum()
-                # the point mass takes L0 and the excluded neighbours (noise around L0)
-                pis[h] = float(np.clip(c[~self.g_support(k[h])].sum(), 1e-6, 1 - 1e-9))
-                sup = self.g_support(k[h])
-                gh = _gauss_smooth(c * sup, self.smooth) * sup
-                g[h] = gh / gh.sum() if gh.sum() > 0 else g[h]
-        for h in range(H):
-            f[h] = (1 - pis[h]) * g[h]; f[h, k[h]] += pis[h]
-        shapes = [(np.nan, np.nan, np.nan, g[h]) for h in range(H)]
-        return dict(k=list(k), f=f, pis=list(pis), shapes=shapes, rho=rho, ll=self.loglik(f, rho),
-                    converged=conv, at_boundary=False)
+                rho = float(np.clip(post[self.unph, 0].mean(), 1e-3, 1 - 1e-3))
+                a = self.prior(rho)
+            for h in range(H):                                   # expected molecules per L, selection undone
+                c = (self.E * (post[:, h] / np.maximum(P[:, h], 1e-300))[:, None]).sum(0) * q[h] / self.s
+                if c.sum() > 0:
+                    f[h] = c / c.sum()
+        return dict(f=f, rho=rho, ll=self.loglik(f, rho), converged=conv, iters=it)
 
     # -------------------------------------------------- run + summaries
     def run(self):
         k0, rho0, ll0 = self.fit_m0()
-        if self.p.shape == "nonparametric":
-            fit = self.fit_nonparametric(k0, rho0)
-        else:
-            fit = self.fit_parametric(k0, rho0)
-        if fit["ll"] < ll0:          # M1 contains M0; fall back to it if the optimiser did worse
-            f = np.zeros((self.H, self.G))
-            for h in range(self.H):
-                f[h, k0[h]] = 1
-            fit = dict(k=list(k0), f=f, pis=[1.0] * self.H,
-                       shapes=[(np.nan, np.nan, np.nan, np.zeros(self.G))] * self.H, rho=rho0, ll=ll0,
-                       converged=True, at_boundary=True)
+        fit = self.fit_free(k0, rho0)
         fit["ll0"] = ll0
-        return self.summarise(fit)
+        rows, f, post = self.summarise(fit)
+        if self.p.bootstrap:
+            self.bootstrap(rows, fit)
+        return rows, f, post
+
+    def stats(self, f):
+        """Per haplotype: (L0, U, p_exp, p_con, mad, mean_shift, n_atoms) on the deviation scale d = L - L0."""
+        out = []
+        for h in range(self.H):
+            mode = int(self.grid[int(np.argmax(f[h]))])
+            L0 = int(min(self.anchors, key=lambda a: abs(a - mode))) if self.anchors else mode
+            d = self.grid - L0
+            far = np.abs(d) >= self.delta
+            out.append((L0, float(f[h][far].sum()), float(f[h][d >= self.delta].sum()),
+                        float(f[h][d <= -self.delta].sum()), float((np.abs(d) * f[h]).sum()), float((d * f[h]).sum()),
+                        int((f[h] >= 0.01).sum())))
+        return out
+
+    def bootstrap(self, rows, fit):
+        """95% intervals of U and mad from read resamples, warm-started at the fit; haplotypes matched by L0."""
+        rng = np.random.default_rng(self.p.seed)
+        full = (self.E, self.m, self.w, self.unph, self.n)
+        L0 = [r["L0"] for r in rows]
+        U, M = [], []
+        try:
+            for _ in range(self.p.bootstrap):
+                ii = rng.integers(0, full[4], full[4])
+                self.E, self.m, self.w, self.unph, self.n = full[0][ii], full[1][ii], full[2][ii], full[3][ii], full[4]
+                st = self.stats(self.fit_free(None, fit["rho"], fit["f"])["f"])
+                if self.H == 2 and abs(st[0][0] - L0[1]) + abs(st[1][0] - L0[0]) < abs(st[0][0] - L0[0]) + abs(st[1][0] - L0[1]):
+                    st = st[::-1]
+                U.append([x[1] for x in st]); M.append([x[4] for x in st])
+        finally:
+            self.E, self.m, self.w, self.unph, self.n = full
+        U, M = np.array(U), np.array(M)
+        for h, r in enumerate(rows):
+            r.update(U_lo=float(np.quantile(U[:, h], 0.025)), U_hi=float(np.quantile(U[:, h], 0.975)),
+                     mad_lo=float(np.quantile(M[:, h], 0.025)), mad_hi=float(np.quantile(M[:, h], 0.975)))
 
     def summarise(self, fit):
         H, grid = self.H, self.grid
-        f, k, rho = fit["f"], fit["k"], fit["rho"]
+        f, rho = fit["f"], fit["rho"]
         a = self.prior(rho)
         q = f * self.s[None, :]
-        Z = q.sum(1, keepdims=True)
-        P = self.E @ (q / Z).T
+        q = q / q.sum(1, keepdims=True)
+        P = self.E @ q.T
         tot = (a * P).sum(1)
         post = a * P / np.maximum(tot, 1e-300)[:, None]
-        delta = max(3, self.period)
         rows = []
-        for h in range(H):
-            pi = fit["pis"][h]
-            xi, om, al, g = fit["shapes"][h]
-            L0 = int(grid[k[h]])
-            gv = (g * self.s) / max((f[h] * self.s).sum(), 1e-300) * (1 - pi)
-            var_lik = self.E @ gv                                # variable part of read lik
-            v = a[:, h] * var_lik / np.maximum(tot, 1e-300)
-            gm = float((grid * g).sum()) if g.sum() > 0 else np.nan
-            gsd = float(np.sqrt(max((g * (grid - gm) ** 2).sum(), 0))) if g.sum() > 0 else np.nan
+        for h, (L0, U, pe, pc, mad, shift, atoms) in enumerate(self.stats(f)):
+            far = np.abs(grid - L0) >= self.delta
+            v = a[:, h] * (self.E @ (q[h] * far)) / np.maximum(tot, 1e-300)   # reads from the unstable part
+            keep = f[h] >= 1e-4
             rows.append(dict(
-                hap=h + 1, L0=L0, pi=pi, var_weight=1 - pi, g_xi=xi, g_omega=om, g_alpha=al, g_mean=gm, g_sd=gsd,
-                p_exp=float(f[h][grid >= L0 + delta].sum()), p_con=float(f[h][grid <= L0 - delta].sum()),
-                mean_abs_dev=float((np.abs(grid - L0) * f[h]).sum()),
-                n_eff=float(post[:, h].sum()), n_phased_eff=float(post[~self.unph, h].sum()),
+                hap=h + 1, L0=L0, U=U, p_exp=pe, p_con=pc, mad=mad, mean_shift=shift,
+                n_atoms=atoms, n_eff=float(post[:, h].sum()), n_phased_eff=float(post[~self.unph, h].sum()),
                 n_var_eff=float(v.sum()), n_support=int((v > 0.5).sum()),
-                unphased_var_frac=float(v[self.unph].sum() / v.sum()) if v.sum() > 1e-9 else np.nan))
+                unphased_var_frac=float(v[self.unph].sum() / v.sum()) if v.sum() > 1e-9 else np.nan,
+                f_L=grid[keep].astype(int).tolist(), f_p=f[h][keep].round(5).tolist()))
         share = np.array([rho, 1 - rho]) if (H == 2 and self.unph.any()) else \
             np.array([r["n_eff"] for r in rows]) / max(sum(r["n_eff"] for r in rows), 1e-12)
-        pooled = dict(pooled_var_weight=float(sum(share[h] * rows[h]["var_weight"] for h in range(H))),
-                      pooled_p_exp=float(sum(share[h] * rows[h]["p_exp"] for h in range(H))),
-                      pooled_p_con=float(sum(share[h] * rows[h]["p_con"] for h in range(H))))
+        pooled = {f"pooled_{c}": float(sum(share[h] * rows[h][c] for h in range(H)))
+                  for c in ("U", "p_exp", "p_con", "mad", "mean_shift")}
         L0s = [r["L0"] for r in rows]
         for h, r in enumerate(rows):
             if H == 1:
@@ -373,9 +261,8 @@ class LocusFit:
             else:
                 r["hap_rank"] = "short" if L0s[h] == min(L0s) else "long"
             r.update(pooled, share=float(share[h]), rho=float(rho), n_reads=self.n,
-                     n_unphased=int(self.unph.sum()), ll_m0=fit["ll0"], ll_m1=fit["ll"],
-                     d_ll=fit["ll"] - fit["ll0"], converged=fit["converged"], at_boundary=fit["at_boundary"],
-                     shape=self.p.shape, delta=delta)
+                     n_unphased=int(self.unph.sum()), ll_m0=fit["ll0"], ll=fit["ll"], d_ll=fit["ll"] - fit["ll0"],
+                     converged=fit["converged"], iters=fit["iters"], delta=self.delta)
         return rows, f, post
 
 

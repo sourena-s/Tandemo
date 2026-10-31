@@ -31,15 +31,37 @@ LOCUS_FEATURES = {
     "gc": ("gc", "id", "GC fraction of the reference repeat"),
     "hp_frac": ("hp_frac", "id", "fraction of repeat bases in homopolymer runs >= 4"),
     "max_hp_log": ("max_hp", "log1p", "longest homopolymer in the repeat, log"),
-    "cx3": ("cx3", "id", "3-mer complexity of the repeat (distinct / possible)"),
     "flank_cx": ("flank_cx", "id", "3-mer complexity of the lower-complexity flank"),
+    "segdup": ("segdup", "id", "fraction of the repeat inside a segmental duplication (paralogous reads may collapse)"),
+    "elem_gc": ("elem_gc", "id", "GC fraction of the locus's motif elements"),
+    "elem_entropy": ("elem_entropy", "id", "Shannon entropy of the motif elements' base composition, bits (0-2)"),
+    "purity": ("purity", "id", "fraction of repeat positions whose base recurs one period later (1 = pure, no interruptions)"),
+    "n_motifs_log": ("n_motifs", "log1p", "number of distinct motif elements at the locus, log"),
 }
+# inputs of earlier models only: still computed for them, not used for new training
+LEGACY_FEATURES = {
+    "cx3": ("cx3", "id", "3-mer complexity of the repeat (distinct / possible); replaced by elem_entropy and purity"),
+}
+# 5mC at CpGs (MM/ML C+m calls; the PacBio model calls CpG context only). Means and fractions only, never counts
+# (a CpG count over the repeat would scale with Y). Optional at inference: missing values get the training median
+# and mC_avail = 0, and training masks them for a share of reads so the network also learns to do without.
+METH_FEATURES = {
+    "mC_flank": ("mC_flank", "id", "mean 5mC probability over CpG calls in the read's two 128 bp flanks"),
+    "mC_rep": ("mC_rep", "id", "mean 5mC probability over CpG calls in the read's repeat bases"),
+    "mC_cert": ("mC_cert", "id", "share of the read's CpG calls (flanks + repeat) that are decisive (p <= 0.2 or >= 0.8)"),
+    "mC_avail": ("mC_avail", "avail", "1 when the read carries 5mC calls at the locus, else 0 (masked in training)"),
+}
+METH_NAMES = list(METH_FEATURES)
 L_FEATURES = {
     "L_log": "candidate true length, log(1 + L), standardised",
     "L_vs_ref": "log(1 + L) - log(1 + reference length): distance of the allele from the reference",
     "L_units_log": "log(1 + L / period): candidate length in motif units",
 }
-X_NAMES = list(READ_FEATURES) + list(LOCUS_FEATURES)
+X_NAMES = list(READ_FEATURES) + list(METH_FEATURES) + list(LOCUS_FEATURES)
+X_NAMES_NO_METH = list(READ_FEATURES) + list(LOCUS_FEATURES)          # training with --no-methylation
+# the 16 inputs of the first models, which did not store their feature list
+FIRST_MODEL_NAMES = list(READ_FEATURES) + ["period_log", "ref_len_log", "gc", "hp_frac", "max_hp_log", "cx3", "flank_cx"]
+ALL_FEATURES = {**READ_FEATURES, **METH_FEATURES, **LOCUS_FEATURES, **LEGACY_FEATURES}
 
 
 def _tf(v: np.ndarray, kind: str) -> np.ndarray:
@@ -63,11 +85,18 @@ def _tf(v: np.ndarray, kind: str) -> np.ndarray:
     return v
 
 
-def raw_x(df: pd.DataFrame) -> np.ndarray:
+def raw_x(df: pd.DataFrame, names=None) -> np.ndarray:
+    """Raw feature matrix [n, len(names)] (default X_NAMES). A source column the table lacks (e.g. methylation in
+    an older extraction) gives NaN, and mC_avail = 0."""
     cols = []
-    for spec in list(READ_FEATURES.values()) + list(LOCUS_FEATURES.values()):
-        src, kind = spec[0], spec[1]
-        v = df[src].to_numpy(dtype=float).copy()
+    for name in (names or X_NAMES):
+        src, kind = ALL_FEATURES[name][0], ALL_FEATURES[name][1]
+        if kind == "avail":
+            have = [df[c].to_numpy(dtype=float) for c in ("mC_flank", "mC_rep") if c in df]
+            v = np.zeros(len(df)) if not have else np.any([~np.isnan(h) for h in have], axis=0).astype(float)
+            cols.append(v)
+            continue
+        v = df[src].to_numpy(dtype=float).copy() if src in df else np.full(len(df), np.nan)
         if src == "np":
             v[v < 0] = np.nan          # tag missing
         cols.append(_tf(v, kind))
@@ -95,6 +124,7 @@ class Scaler:
     def l_feats(self, L, ref_len, period) -> np.ndarray:
         """L features for candidate lengths L (any shape; ref_len and period broadcast)."""
         L = np.asarray(L, dtype=float)
+        L = np.maximum(L, 0)                 # a pad deletion longer than the allele: no negative lengths
         a = (np.log1p(L) - self.lmu) / self.lsd
         b = np.log1p(L) - np.log1p(ref_len)
         c = np.log1p(L / np.maximum(period, 1))

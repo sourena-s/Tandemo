@@ -187,17 +187,47 @@ $w_1=\sigma(\mathrm{LLR})$,\\ clipped to $[\epsilon,1-\epsilon]$};
 $w_1=\rho$: the haplotype share\\ fitted in Stage~2};
 \end{tikzpicture}
 \caption{Phase weight of a read. Every phased het SNV the read covers counts, not only those in the flanks. Only
-SNVs in the locus's phase block (the PS of the phased TRGT record, or of the nearest het SNVs) count. Indels are
-not used, because HiFi's residual errors are mostly homopolymer indels. $w_1$ is a \emph{prior} from germline
+sites in the locus's phase block (the PS of the phased TRGT record, or of the nearest het sites) count. Het indels
+count too, when the read's bases from 10\,bp before to 10\,bp after the indel match one haplotype's sequence
+exactly: they add $\pm\log\frac{1-e}{e}$ with $e=0.01$, or $e=0.05$ in a homopolymer run $\geq4$, where HiFi's
+residual errors concentrate. Indels within 5\,bp of any catalog repeat are not used, since their alleles are repeat
+lengths. $w_1$ is a \emph{prior} from germline
 evidence alone. Length never enters it, so length cannot be used circularly to hide instability. The cap $\epsilon$
 keeps one misphased read from forcing an outlier onto the wrong haplotype.}
 \end{figure}
 
 \subsection{Germline alleles from TRGT}
-TRGT reports each allele's length over the catalog interval (\texttt{FORMAT/AL}), on the same scale as $Y$. When
-HiPhase has phased the TRGT VCF, allele~$k$ of the genotype belongs to haplotype~$k{+}1$ of that block. Otherwise,
-for training, the orientation is taken from confidently phased reads: the orientation that puts each haplotype's
-median $Y$ nearer its allele wins. Haploid calls (one AL value) give one haplotype.
+TRGT reports each allele's length over the catalog interval $[s,e)$ (\texttt{FORMAT/AL}). When HiPhase has phased
+the TRGT VCF, allele~$k$ of the genotype belongs to haplotype~$k{+}1$ of that block. Otherwise, for training, the
+orientation is taken from confidently phased reads: the orientation that puts each haplotype's median $Y$ nearer
+its allele wins. Haploid calls (one AL value) give one haplotype.
+
+\paragraph{Putting TRGT alleles on the scale of $Y$: the pads.} $Y$ spans more than the catalog interval: from
+$s-\textit{pad}$ to $e+\textit{pad}$, minus the $2\,\textit{pad}$ anchor bases. The two pads are fixed 10\,bp
+windows immediately outside the repeat, $[s-10,\,s)$ and $[e,\,e+10)$, with no further slop. A germline indel in
+a pad changes every read's $Y$ but not TRGT's allele, so without a correction network~1 would learn it as a
+systematic read error. Extraction therefore records, from the phased small-variant VCF, the net length change of
+the germline indels in the two pads on each VCF haplotype ($d_1,d_2$), and training uses
+\[
+L_h = \mathrm{AL}_h + d_h,
+\]
+oriented to haplotypes with the same phase evidence as the alleles. Indels further from the repeat lie outside
+$Y$ and do not matter. A locus is left out of training when its pads cannot be resolved:
+\begin{center}\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+event & treatment \\
+\midrule
+indel inside a pad (homozygous, or het in the locus's phase block) & added to $L_h$ \\
+insertion exactly at $s$ or $e$ (TRGT may or may not count it) & locus excluded (ambiguous) \\
+deletion spanning $s$ or $e$ & locus excluded (ambiguous) \\
+deletion crossing the outer pad edge $s-10$ or $e+10$ & locus excluded (ambiguous) \\
+het pad indel unphased, or in another phase block & locus excluded (unphased) \\
+\bottomrule
+\end{tabular}
+\end{center}
+On HG002 chr4 (T2T, Platinum TRs), 1{,}446 of 503{,}547 genotyped loci (0.3\%) carry a pad indel; 8{,}859 are
+excluded as ambiguous, mostly homopolymers and dinucleotides, and 91 as unphased.
 
 %=====================================================================
 \section{Network 1: the read-generation likelihood}
