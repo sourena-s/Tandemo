@@ -6,6 +6,7 @@
 # (only time used is charged): a 190x donor such as NA19909 takes several times longer per chromosome.
 # The unfiltered catalog is used so any later catalog filter finds its loci genotyped.
 #   bash slurm/trgt_t2t_genome.sh <sample> <bam> <karyotype XX|XY> [out dir] [catalog .bed.gz]
+# ARRAY=0,9,22 (environment) runs only those tasks (chromosome indices in CHR below), e.g. to redo some.
 set -euo pipefail
 S=${1:?sample}; BAM=${2:?bam}; K=${3:?karyotype}
 O=${4:-/scratch-shared/$USER/trgt_t2t/$S.genome}
@@ -23,7 +24,7 @@ if [ ! -s $O/catalog/$N.chr1.bed ] || [ $CAT -nt $O/catalog/$N.chr1.bed ]; then 
     rm -f $O/catalog/$N.*.bed                                                 # over the file; again when it is newer
     zcat $CAT | awk -v d=$O/catalog -v n=$N '{ f = d "/" n "." $1 ".bed"; print > f }'
 fi
-sbatch --parsable -J trgt-t2t-$S -p genoa -c 24 --mem=42G -t 04:00:00 --array=0-$(( ${#CHR[@]} - 1 )) \
+sbatch --parsable -J trgt-t2t-$S -p genoa -c 24 --mem=42G -t 04:00:00 --array=${ARRAY:-0-$(( ${#CHR[@]} - 1 ))} \
     -o $O/logs/trgt.%A_%a.out --wrap "set -euo pipefail; export PATH=$ENVB:\$PATH; cd $O
     C=(${CHR[*]}); c=\${C[\$SLURM_ARRAY_TASK_ID]}
     [ -s catalog/$N.\$c.bed ] || exit 0          # no loci on this chromosome in the catalog (chrY in Chiu et al.)

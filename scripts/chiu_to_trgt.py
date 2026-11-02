@@ -40,7 +40,13 @@ disease repeat and the outer one its context; the pair is listed in the merges t
 (--pathogenic: a TRGT catalogue whose disease loci have IDs ending in _pathogenic, e.g. PlatinumTRs) whose motifs
 the inner record shares (up to rotation or strand: FXN's AAG is its GAA), the inner record is the disease repeat and
 the outer one, reaching into the flanks, gets "_nested" appended to its ID; where the inner record's motifs are not
-the disease's (AFF3: the disease's GCC is the outer record's), nothing is renamed. Groups that would
+the disease's (AFF3: the disease's GCC is the outer record's), nothing is renamed.
+
+PacBio disease loci (--pacbio-pathogenic: their T2T placements from scripts/pacbio_pathogenic_t2t.py, for the loci of
+TRGT's pathogenic_repeats.hg38.bed that PlatinumTRs has no _pathogenic locus for): the record over a placement that
+carries its motif (up to rotation or strand; the most overlap if several) gets "_<GENE>_pacbio_pathogenic" appended
+to its ID. Where no record does (NOTCH2NLA, absent from Chiu et al.), the --pathogenic catalogue's record(s) over the
+placement are added, their ID with "_<GENE>_platinum_pacbio_pathogenic" appended. Groups that would
 pass --max-merged stay as separate records, so a chain of overlaps in a repeat-dense region does not become one
 long locus.
 
@@ -53,7 +59,7 @@ Side outputs (next to --out, the .bed.gz name with .merges.tsv / .summary.tsv):
 Usage (on Snellius: slurm/chiu_to_trgt.sh):
     python scripts/chiu_to_trgt.py --catalog chm13.v2.bed.gz --reference chm13v2.0_maskedY_rCRS.fa \
         --out chm13v2.0.chiu2026.v2.trgt.bed.gz [--min-motif-frac 0.1] [--max-merged 1000] [--threads 16] \
-        [--pathogenic chm13v2.0_maskedY_rCRS.platinumTRs-v1.0.trgt.bed.gz]
+        [--pathogenic chm13v2.0_maskedY_rCRS.platinumTRs-v1.0.trgt.bed.gz] [--pacbio-pathogenic pacbio.t2t.tsv]
 """
 import argparse
 import collections
@@ -162,6 +168,9 @@ def main():
     ap.add_argument("--threads", type=int, default=16, help="tr-solve workers for the merged loci")
     ap.add_argument("--pathogenic", help="TRGT catalogue with disease loci (IDs ending _pathogenic): at a nested "
                                          "pair whose inner record carries the disease motif, the outer gets _nested")
+    ap.add_argument("--pacbio-pathogenic", help="T2T placements of PacBio disease loci (pacbio_pathogenic_t2t.py): "
+                                                "their records get _<GENE>_pacbio_pathogenic; where none, the "
+                                                "--pathogenic catalogue's records are added (_platinum_pacbio_pathogenic)")
     a = ap.parse_args()
     REFERENCE = a.reference
 
@@ -218,9 +227,40 @@ def main():
         stats["merged loci"] += 1
         stats["records merged into them"] += len(mem)
 
+    renamed = {}                                         # ID -> ID with a PacBio disease label
+    if a.pacbio_pathogenic:
+        place = [line.rstrip("\n").split("\t") for line in open(a.pacbio_pathogenic)][1:]
+        plat = collections.defaultdict(list)             # the --pathogenic catalogue's records on those chromosomes
+        if a.pathogenic:
+            chroms = {p_[1] for p_ in place}
+            with gzip.open(a.pathogenic, "rt") as fh:
+                for line in fh:
+                    f = line.rstrip("\n").split("\t")
+                    if f[0] in chroms:
+                        kv = dict(x.split("=", 1) for x in f[3].split(";") if "=" in x)
+                        plat[f[0]].append((int(f[1]), int(f[2]), kv["ID"], kv["MOTIFS"].split(","),
+                                           re.findall(r"\(([ACGT]+)\)n", kv["STRUC"])))
+        for gene, chrom, ps, pe, _strand, _k, pm in place:
+            ps, pe, pm = int(ps), int(pe), pm.upper().split(",")
+            ov = lambda s_, e_: min(e_, max(pe, ps + 1)) - max(s_, ps)   # overlap (a 0-bp placement counts as 1 bp)
+            cand = [r for r in rows if r[0] == chrom and ov(r[1], r[2]) > 0 and
+                    any(same_motif(m, x) for m in r[4] for x in pm)]
+            if cand:
+                r = max(cand, key=lambda r: ov(r[1], r[2]))
+                renamed[r[3]] = f"{r[3]}_{gene}_pacbio_pathogenic"
+                table.append((f"pacbio pathogenic {gene}", r[3], [f"{chrom}:{ps}-{pe}"]))
+                stats["PacBio disease loci labelled on a record"] += 1
+            else:                                        # none: the --pathogenic catalogue's record(s) there
+                for s_, e_, pid, ms, st in plat.get(chrom, ()):
+                    if ov(s_, e_) > 0:
+                        lid = f"{pid}_{gene}_platinum_pacbio_pathogenic"
+                        rows.append((chrom, s_, e_, lid, ms, st or None))
+                        table.append((f"pacbio pathogenic {gene} (added from --pathogenic)", lid, [f"{chrom}:{ps}-{pe}"]))
+                        stats["PacBio disease records added from --pathogenic"] += 1
+
     order = {c: i for i, c in enumerate(clen)}           # the reference's chromosome order, then position
     rows.sort(key=lambda r: (order[r[0]], r[1], r[2]))
-    name = lambda lid: lid + "_nested" if lid in nested_out else lid
+    name = lambda lid: renamed.get(lid, lid + "_nested" if lid in nested_out else lid)
     for _c, _s, _e, _i, ms, _st in rows:
         stats[f"motifs per record: {min(len(ms), 4)}{'+' if len(ms) >= 4 else ''}"] += 1
     plain = a.out[:-3] if a.out.endswith(".gz") else a.out
