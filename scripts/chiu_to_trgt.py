@@ -35,19 +35,25 @@ adjacent) joins the group, unless the group would then exceed --max-merged bp; t
             writes it, although interruptions split the tract into many short spans); where tr-solve finds no
             structure, the members' motifs in member order
 A record that lies wholly inside the current group (nested: FXN's (AAG)n inside an A-rich record, GIPC1's (CCG)n
-inside a (CCGCCT)n record) is not merged: both it and the record around it stay as they are, since the inner one is
-often the disease repeat and the outer one its context; the pair is listed in the merges table. Groups that would
+inside a (CCGCCT)n record) is not merged: both it and the record around it stay, since the inner one is often the
+disease repeat and the outer one its context; the pair is listed in the merges table. At a disease locus
+(--pathogenic: a TRGT catalogue whose disease loci have IDs ending in _pathogenic, e.g. PlatinumTRs) whose motifs
+the inner record shares (up to rotation or strand: FXN's AAG is its GAA), the inner record is the disease repeat and
+the outer one, reaching into the flanks, gets "_nested" appended to its ID; where the inner record's motifs are not
+the disease's (AFF3: the disease's GCC is the outer record's), nothing is renamed. Groups that would
 pass --max-merged stay as separate records, so a chain of overlaps in a repeat-dense region does not become one
 long locus.
 
 Side outputs (next to --out, the .bed.gz name with .merges.tsv / .summary.tsv):
-    merges.tsv   kind (merged | nested), the locus written (merged ID, or the outer record), its members (IDs)
+    merges.tsv   kind (merged | nested | nested at a disease locus), the locus written (merged ID, or the outer
+                 record, as written), its members (IDs)
     summary.tsv  counts: loci read, records written, merged loci and the records in them, nested pairs, groups left
                  unmerged by the cap, motifs per record
 
 Usage (on Snellius: slurm/chiu_to_trgt.sh):
     python scripts/chiu_to_trgt.py --catalog chm13.v2.bed.gz --reference chm13v2.0_maskedY_rCRS.fa \
-        --out chm13v2.0.chiu2026.v2.trgt.bed.gz [--min-motif-frac 0.1] [--max-merged 1000] [--threads 16]
+        --out chm13v2.0.chiu2026.v2.trgt.bed.gz [--min-motif-frac 0.1] [--max-merged 1000] [--threads 16] \
+        [--pathogenic chm13v2.0_maskedY_rCRS.platinumTRs-v1.0.trgt.bed.gz]
 """
 import argparse
 import collections
@@ -80,6 +86,24 @@ def motifs_of(consensus: str, freq: str, calls: int, min_frac: float) -> list[st
             continue
         out.append(m)
         seen |= rotations(m)
+    return out
+
+
+def same_motif(a: str, b: str) -> bool:
+    """One motif up to rotation or strand (CAG = AGC = CTG)."""
+    rc = b[::-1].translate(str.maketrans("ACGT", "TGCA"))
+    return len(a) == len(b) and (a in rotations(b) or a in rotations(rc))
+
+
+def disease_loci(path: str) -> dict:
+    """{chrom: [(start, end, ID, motifs)]} of the loci whose ID ends in _pathogenic in a TRGT catalogue."""
+    out = collections.defaultdict(list)
+    with gzip.open(path, "rt") as fh:
+        for line in fh:
+            c, s, e, inf = line.rstrip("\n").split("\t")[:4]
+            kv = dict(x.split("=", 1) for x in inf.split(";") if "=" in x)
+            if kv.get("ID", "").endswith("_pathogenic"):
+                out[c].append((int(s), int(e), kv["ID"], kv.get("MOTIFS", "").upper().split(",")))
     return out
 
 
@@ -136,6 +160,8 @@ def main():
                     help="an alternative motif joins MOTIFS when this fraction of called haplotypes carries it")
     ap.add_argument("--max-merged", type=int, default=1000, help="longest merged locus, bp")
     ap.add_argument("--threads", type=int, default=16, help="tr-solve workers for the merged loci")
+    ap.add_argument("--pathogenic", help="TRGT catalogue with disease loci (IDs ending _pathogenic): at a nested "
+                                         "pair whose inner record carries the disease motif, the outer gets _nested")
     a = ap.parse_args()
     REFERENCE = a.reference
 
@@ -153,17 +179,27 @@ def main():
             ms = motifs_of(motif, f[9], int(f[8]), a.min_motif_frac)
             by_chrom[chrom].append((chrom, s0, e1, f"chiu2026_{chrom}_{s0}_{e1}", ms))
 
-    rows, table, merged = [], [], []                     # records out, the merges table, merged loci to solve
-    for chrom in sorted(by_chrom, key=list(clen).index):
+    dis = disease_loci(a.pathogenic) if a.pathogenic else {}
+    rows, table, merged = [], [], []                     # records out (chrom, s0, e1, ID, MOTIFS, STRUC), the
+    nested_out = set()                                   # merges table, merged loci to solve; outer records at a
+    for chrom in sorted(by_chrom, key=list(clen).index): # disease locus (renamed _nested)
         recs = sorted(by_chrom[chrom], key=lambda r: (r[1], -r[2]))
         for kind, mem in groups(recs, a.max_merged):
             if kind == "nested":
-                table.append(("nested", mem[0][3], [mem[1][3]]))
+                outer, inner = mem
+                hit = [d for d in dis.get(chrom, ()) if d[0] < inner[2] and inner[1] < d[1] and
+                       any(same_motif(m, dm) for m in inner[4] for dm in d[3])]
+                if hit:                                  # the inner record is the disease repeat
+                    nested_out.add(outer[3])
+                    table.append((f"nested at {hit[0][2]}", outer[3], [inner[3]]))
+                    stats["nested pairs at a disease locus (outer renamed _nested)"] += 1
+                else:
+                    table.append(("nested", outer[3], [inner[3]]))
                 stats["nested pairs (both kept)"] += 1
             elif kind == "capped":
                 stats["side-by-side records left apart (over --max-merged)"] += 1
             elif kind == "single":
-                rows.append((chrom, mem[0][1], mem[0][2], info(mem[0][3], mem[0][4])))
+                rows.append((chrom, mem[0][1], mem[0][2], mem[0][3], mem[0][4], None))
             else:
                 s0, e1 = mem[0][1], max(x[2] for x in mem)
                 ms = list(dict.fromkeys(m for x in mem for m in x[4]))
@@ -171,10 +207,12 @@ def main():
     with Pool(a.threads) as p:                           # merged loci: their structure, from the reference
         solved = p.map(structure, [(c, s, e, ms) for c, s, e, _i, ms, _m in merged], chunksize=200)
     for (chrom, s0, e1, lid, ms, mem), sv in zip(merged, solved):
+        if any(x in nested_out for x in mem):            # a merged locus around a disease repeat
+            nested_out.add(lid)
         if sv:
-            rows.append((chrom, s0, e1, info(lid, sv[0], sv[1])))
+            rows.append((chrom, s0, e1, lid, sv[0], sv[1]))
         else:                                            # no structure: the members' motifs in member order
-            rows.append((chrom, s0, e1, info(lid, ms)))
+            rows.append((chrom, s0, e1, lid, ms, None))
             stats["merged loci without a tr-solve structure"] += 1
         table.append(("merged", lid, mem))
         stats["merged loci"] += 1
@@ -182,20 +220,20 @@ def main():
 
     order = {c: i for i, c in enumerate(clen)}           # the reference's chromosome order, then position
     rows.sort(key=lambda r: (order[r[0]], r[1], r[2]))
-    for _c, _s, _e, inf in rows:
-        n = len(inf.split("MOTIFS=")[1].split(";")[0].split(","))
-        stats[f"motifs per record: {min(n, 4)}{'+' if n >= 4 else ''}"] += 1
+    name = lambda lid: lid + "_nested" if lid in nested_out else lid
+    for _c, _s, _e, _i, ms, _st in rows:
+        stats[f"motifs per record: {min(len(ms), 4)}{'+' if len(ms) >= 4 else ''}"] += 1
     plain = a.out[:-3] if a.out.endswith(".gz") else a.out
     with open(plain, "w") as fo:
-        for chrom, s0, e1, inf in rows:
-            fo.write(f"{chrom}\t{s0}\t{e1}\t{inf}\n")
+        for chrom, s0, e1, lid, ms, st in rows:
+            fo.write(f"{chrom}\t{s0}\t{e1}\t{info(name(lid), ms, st)}\n")
     pysam.tabix_index(plain, preset="bed", force=True)   # bgzip (plain -> plain.gz) and .tbi; removes plain
     stats["records written"] = len(rows)
     stem = a.out[:-7] if a.out.endswith(".bed.gz") else a.out
     with open(stem + ".merges.tsv", "w") as fm:
         fm.write("kind\tlocus\tmembers\n")
         for kind, lid, mem in table:
-            fm.write(f"{kind}\t{lid}\t{','.join(mem)}\n")
+            fm.write(f"{kind}\t{name(lid)}\t{','.join(mem)}\n")
     with open(stem + ".summary.tsv", "w") as fs:
         for k, v in sorted(stats.items()):
             fs.write(f"{k}\t{v}\n")
