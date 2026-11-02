@@ -19,8 +19,10 @@ CHR=(chr1 chr2 chr3 chr4 chr5 chr6 chr7 chr8 chr9 chr10 chr11 chr12 chr13 chr14 
      chr21 chr22 chrX chrY)
 [ $K = XX ] && unset 'CHR[23]'
 mkdir -p $O/logs $O/catalog
-[ -s $O/catalog/$N.chr1.bed ] ||             # per-chromosome catalogs, one pass over the file
+if [ ! -s $O/catalog/$N.chr1.bed ] || [ $CAT -nt $O/catalog/$N.chr1.bed ]; then   # per-chromosome catalogs, one pass
+    rm -f $O/catalog/$N.*.bed                                                 # over the file; again when it is newer
     zcat $CAT | awk -v d=$O/catalog -v n=$N '{ f = d "/" n "." $1 ".bed"; print > f }'
+fi
 sbatch --parsable -J trgt-t2t-$S -p genoa -c 24 --mem=42G -t 04:00:00 --array=0-$(( ${#CHR[@]} - 1 )) \
     -o $O/logs/trgt.%A_%a.out --wrap "set -euo pipefail; export PATH=$ENVB:\$PATH; cd $O
     C=(${CHR[*]}); c=\${C[\$SLURM_ARRAY_TASK_ID]}
